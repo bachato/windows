@@ -1013,23 +1013,7 @@ updateImage() {
       return 1
     fi
 
-    local fallback="/run/assets/${DETECTED%%-*}.xml"
-
-    if [[ "$DETECTED" != win20* &&
-          "$asset" == "$fallback" &&
-          "$asset" != "/run/assets/$DETECTED.xml" ]]; then
-
-      if ! sed -i \
-        -e '/<InstallFrom>.*<\/InstallFrom>/d' \
-        -e '/<ProductKey>.*<\/ProductKey>/d' \
-        -e '/<InstallFrom>/,/<\/InstallFrom>/d' \
-        -e '/<ProductKey>/,/<\/ProductKey>/d' \
-        "$answer"; then
-        error "Failed to make answer file edition-neutral: $answer"
-        return 1
-      fi
-
-    fi
+    removeGeneratedXML "$asset" || return 1
 
     if [ -n "${CUSTOM_XML:-}" ]; then
 
@@ -1057,6 +1041,8 @@ updateImage() {
   fi
 
   if enabled "$MANUAL"; then
+
+    removeGeneratedXML "$asset" || return 1
 
     wimlib-imagex update "$wim" "$idx" --command "delete --force /$xml" > /dev/null || true
 
@@ -1203,6 +1189,8 @@ bootWindows() {
 ! parseVersion && exit 58
 ! parseLanguage && exit 56
 ! detectCustom && exit 59
+
+testImages
 
 if ! startInstall; then
   bootWindows && return 0

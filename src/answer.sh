@@ -235,6 +235,40 @@ validateDomainName() {
   return 0
 }
 
+markGeneratedXML() {
+
+  local file="$1"
+  local marker='<!-- generated-answer-file: do not reuse as a template -->'
+
+  [ -s "$file" ] || return 1
+
+  if head -n 1 "$file" | grep -q '^<?xml'; then
+    sed -i "1a$marker" "$file" || return 1
+  else
+    sed -i "1i$marker" "$file" || return 1
+  fi
+
+  return 0
+}
+
+removeGeneratedXML() {
+
+  local file="$1"
+
+  [ -n "$file" ] || return 0
+  [ -f "$file" ] || return 0
+
+  head -n 5 "$file" |
+    grep -Fqi 'generated-answer-file' || return 0
+
+  if ! rm -f "$file"; then
+    error "Failed to remove generated answer file: $file"
+    return 1
+  fi
+
+  return 0
+}
+
 generateEvalXML() {
 
   # Evaluation templates are generated from their normal counterpart so
@@ -247,6 +281,8 @@ generateEvalXML() {
   local index="$detected_index" tmp
 
   [[ "${id,,}" == *"-eval" ]] || return 1
+
+  removeGeneratedXML "$source" || return 1
   [ -s "$source" ] || return 1
 
   if [ -n "$index" ] && [[ ! "$index" =~ ^[1-9][0-9]*$ ]]; then
@@ -307,7 +343,8 @@ generateEvalXML() {
     fi
   fi
 
-  if ! xmllint --nonet --noout "$tmp"; then
+  if ! markGeneratedXML "$tmp" ||
+    ! xmllint --nonet --noout "$tmp"; then
     rm -f "$tmp"
     error "Generated evaluation answer file is invalid!"
     return 1
@@ -322,10 +359,81 @@ generateEvalXML() {
   return 0
 }
 
+generateFallbackXML() {
+
+  # Fallback templates are generated from the generic version so unsupported
+  # editions can use the detected WIM index without inheriting a product key.
+
+  local id="$1"
+  local index="${2:-}"
+  local source="/run/assets/${id%%-*}.xml"
+  local target="/run/assets/$id.xml"
+  local tmp
+
+  [ "$source" != "$target" ] || return 1
+
+  removeGeneratedXML "$source" || return 1
+  [ -s "$source" ] || return 1
+
+  if [ -n "$index" ] && [[ ! "$index" =~ ^[1-9][0-9]*$ ]]; then
+    error "Invalid fallback image index: $index"
+    return 1
+  fi
+
+  if ! tmp=$(mktemp -p /run/assets ".${id}.XXXXXX"); then
+    error "Failed to create a temporary fallback answer file!"
+    return 1
+  fi
+
+  if ! sed \
+      -e '/<InstallFrom>.*<\/InstallFrom>/d' \
+      -e '/<ProductKey>.*<\/ProductKey>/d' \
+      -e '/<InstallFrom>/,/<\/InstallFrom>/d' \
+      -e '/<ProductKey>/,/<\/ProductKey>/d' \
+      "$source" > "$tmp"; then
+    rm -f "$tmp"
+    error "Failed to generate fallback answer file from $source!"
+    return 1
+  fi
+
+  if [ -n "$index" ]; then
+    if ! sed -i \
+      '0,/<InstallTo>/{ /<InstallTo>/i\
+          <InstallFrom>\
+            <MetaData wcm:action="add">\
+              <Key>/IMAGE/INDEX</Key>\
+              <Value>'"$index"'</Value>\
+            </MetaData>\
+          </InstallFrom>
+      }' "$tmp"; then
+      rm -f "$tmp"
+      error "Failed to select fallback image index $index!"
+      return 1
+    fi
+  fi
+
+  if ! markGeneratedXML "$tmp" ||
+    ! xmllint --nonet --noout "$tmp"; then
+    rm -f "$tmp"
+    error "Generated fallback answer file is invalid!"
+    return 1
+  fi
+
+  if ! chmod 644 "$tmp" || ! mv -f "$tmp" "$target"; then
+    rm -f "$tmp"
+    error "Failed to create fallback answer file: $target"
+    return 1
+  fi
+
+  return 0
+}
+
 setXML() {
 
   local file
   local index="${2:-}"
+  local target="/run/assets/$DETECTED.xml"
+
   local custom_files=(
     "/custom.xml"
     "$STORAGE/custom.xml"
@@ -333,6 +441,8 @@ setXML() {
   )
 
   CUSTOM_XML=""
+
+  removeGeneratedXML "$target" || return 1
 
   if [ -d "${custom_files[0]}" ]; then
     error "The bind ${custom_files[0]} maps to a file that does not exist!"
@@ -347,6 +457,22 @@ setXML() {
     fi
   done
 
+  # Known Server editions normally share one answer file. When the image
+  # contains only one uniquely detected Server edition and no explicit
+  # EDITION was requested, generate a keyless answer file using that index.
+  if [ -n "$index" ] && [ -z "${EDITION:-}" ] &&
+    [[ "${DETECTED,,}" == win20* && "${DETECTED,,}" != *-* ]] &&
+    [ -s "$target" ]; then
+
+    file="/run/assets/$DETECTED-selected.xml"
+
+    removeGeneratedXML "$file" || return 1
+    generateFallbackXML "$DETECTED-selected" "$index" || return 1
+
+    XML="$file"
+    return 0
+  fi
+
   file="$1"
 
   if [[ "${DETECTED,,}" == *"-eval" ]]; then
@@ -356,7 +482,10 @@ setXML() {
   fi
 
   if [ ! -f "$file" ] || [ ! -s "$file" ]; then
-    file="/run/assets/$DETECTED.xml"
+    file="$target"
+  elif [[ "$file" != "$target" ]]; then
+    generateFallbackXML "$DETECTED" "$index" || return 1
+    file="$target"
   fi
 
   [ -f "$file" ] && [ -s "$file" ] || return 1
@@ -710,13 +839,14 @@ updateXML() {
   fi
 
   if [ -n "${EDITION:-}" ]; then
-    case "${EDITION,,}" in
-      "core" ) edition="STANDARDCORE" ;;
-      * ) edition="${EDITION^^}" ;;
-    esac
+
+    edition=$(normalizeServerEdition "$EDITION") || return 1
+    edition="${edition//-/}"
+    edition="${edition^^}"
 
     edition=$(escapeXMLSed "$edition") || return 1
     sed -i "s|SERVERSTANDARD</Value>|SERVER$edition</Value>|g" "$asset" || return 1
+
   fi
 
   if [ -n "${KEY:-}" ]; then

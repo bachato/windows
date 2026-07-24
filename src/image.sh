@@ -8,13 +8,24 @@ getPlatform() {
   local platform="x64"
   local arch
 
-  arch=$(sed -n "/$tag/{s/.*<$tag>\(.*\)<\/$tag>.*/\1/;p}" <<< "$xml")
+  local -a arches=()
 
-  case "${arch,,}" in
-    "0" ) platform="x86" ;;
-    "9" ) platform="x64" ;;
-    "12" ) platform="arm64" ;;
-  esac
+  mapfile -t arches < <(
+    sed -n "/$tag/{s/.*<$tag>\(.*\)<\/$tag>.*/\1/;p}" <<< "$xml" |
+      sort -u
+  )
+
+  if [ "${#arches[@]}" -gt 1 ]; then
+    platform="mixed"
+  elif [ "${#arches[@]}" -eq 1 ]; then
+    arch="${arches[0]}"
+
+    case "${arch,,}" in
+      "0" ) platform="x86" ;;
+      "9" ) platform="x64" ;;
+      "12" ) platform="arm64" ;;
+    esac
+  fi
 
   echo "$platform"
   return 0
@@ -31,6 +42,10 @@ checkPlatform() {
     "x86" ) compat="x64" ;;
     "x64" ) compat="$platform" ;;
     "arm64" ) compat="$platform" ;;
+    "mixed" )
+      error "Windows images with mixed architectures are not supported!"
+      return 1
+      ;;
     * ) compat="${PLATFORM,,}" ;;
   esac
 
@@ -86,10 +101,11 @@ hasVersion() {
         fi
       fi
 
-      # Client editions without a dedicated template can use the generic
-      # template. updateImage() makes that copy edition-neutral.
+      # Editions without a dedicated template can use the generic template.
       case "${selected_id,,}" in
-        "win7"* | "win8"* | "win10"* | "win11"* | "winvista"* )
+        "win7"* | "win8"* | "win10"* | "win11"* | "winvista"* | \
+        "win2003"* | "win2008"* | "win2012"* | "win2016"* | \
+        "win2019"* | "win2022"* | "win2025"* )
           file="/run/assets/${selected_id%%-*}.xml"
 
           if [ -s "$file" ]; then
@@ -104,19 +120,80 @@ hasVersion() {
   return 1
 }
 
-selectVersion() {
+getVersionPriority() {
 
-  local tag="$1"
-  local xml="$2"
-  local platform="$3"
-  local suggested="${4:-}"
+  local id="${1%-eval}"
+  local base="$2"
+  local edition="${id#"$base"}"
 
-  local name id base prefer match suffix actual
+  edition="${edition#-}"
+
+  case "$edition" in
+    "iot" | "iot-"* | "enterprise-iot" | "enterprise-iot-"* )
+      echo "iot"
+      ;;
+    "ltsc" | "ltsc-"* | "enterprise-ltsc" | "enterprise-ltsc-"* )
+      echo "ltsc"
+      ;;
+    "enterprise" | "enterprise-"* )
+      echo "enterprise"
+      ;;
+    "ultimate" | "ultimate-"* )
+      echo "ultimate"
+      ;;
+    "education" | "education-"* | "pro-education" | "pro-education-"* )
+      echo "education"
+      ;;
+    "home" | "home-"* )
+      echo "home"
+      ;;
+    "starter" | "starter-"* )
+      echo "starter"
+      ;;
+    "hv" | "hv-"* )
+      echo "hv"
+      ;;
+    "" | "n" | "pro" | "pro-"* | "professional" | "professional-"* | \
+    "business" | "business-"* )
+      echo "default"
+      ;;
+    * )
+      echo "other"
+      ;;
+  esac
+
+  return 0
+}
+
+detectVersion() {
+
+  local xml="$1"
+  local suggested="${2:-}"
+
+  local tag name id base prefer match platform
+  local priority actual edition suffix i
   local tried=""
 
+  local -a tags=(
+    "DISPLAYNAME"
+    "PRODUCTNAME"
+    "NAME"
+  )
   local -a versions=()
   local -a bases=()
+  local -a groups=()
   local -a priorities=(
+    "enterprise"
+    "ultimate"
+    "default"
+    "iot"
+    "ltsc"
+    "education"
+    "home"
+    "starter"
+    "hv"
+  )
+  local -a suffixes=(
     "-enterprise"
     "-ultimate"
     ""
@@ -128,43 +205,54 @@ selectVersion() {
     "-hv"
   )
 
-  while IFS= read -r name; do
-    [[ "$name" == *"Operating System"* ]] && continue
-    [ -z "$name" ] && continue
+  platform=$(getPlatform "$xml")
 
-    base=$(fromName "$name" "$platform")
-    id=$(getVersion "$name" "$platform")
+  for tag in "${tags[@]}"; do
+    while IFS= read -r name; do
+      [[ "$name" == *"Operating System"* ]] && continue
+      [ -z "$name" ] && continue
 
-    if [ -z "$base" ] || [ -z "$id" ]; then
-      warn "Unknown ${tag,,}: '$name'"
-      continue
-    fi
+      base=$(fromName "$name" "$platform")
+      id=$(getVersion "$name" "$platform")
 
-    versions+=("$id")
-    bases+=("$base")
-  done < <(
-    sed -n \
-      "/$tag/{s/.*<$tag>\(.*\)<\/$tag>.*/\1/;p}" \
-      <<< "$xml"
-  )
+      if [ -z "$base" ] || [ -z "$id" ]; then
+        warn "Unknown ${tag,,}: '$name'"
+        continue
+      fi
+
+      versions+=("$id")
+      bases+=("$base")
+      groups+=("$(getVersionPriority "$id" "$base")")
+    done < <(
+      sed -n \
+        "/$tag/{s/.*<$tag>\(.*\)<\/$tag>.*/\1/;p}" \
+        <<< "$xml"
+    )
+  done
 
   [ "${#versions[@]}" -eq 0 ] && return 0
 
   if [ -n "$EDITION" ]; then
 
     for base in "${bases[@]}"; do
-      [[ "${base,,}" == win20* ]] && continue
 
-      tried="Y"
+      case "${base,,}" in
+        "win2003"* | "win2008"* | "win2012"* | "win2016"* | \
+        "win2019"* | "win2022"* | "win2025"* )
+          edition=$(normalizeServerEditionID "$EDITION")
 
-      case "${EDITION,,}" in
-        "pro" | "professional" | "business" )
-          prefer="$base"
+          # Known Server editions continue using the generic Server ID.
+          # updateXML() applies Standard, Datacenter or Core to that template.
+          [ -z "$edition" ] && continue
           ;;
         * )
-          prefer="$base-${EDITION,,}"
+          edition=$(normalizeEditionID "$EDITION" "$base")
           ;;
       esac
+
+      tried="Y"
+      prefer="$base"
+      [ -n "$edition" ] && prefer+="-$edition"
 
       if match=$(hasVersion "$prefer" "${versions[@]}"); then
         echo "$match"
@@ -173,7 +261,7 @@ selectVersion() {
     done
 
     if [ -n "$tried" ]; then
-      warn "Edition '$EDITION' is not supported by this image, using automatic selection instead."
+      warn "edition '$EDITION' is not supported by this image, using automatic selection instead."
     fi
   fi
 
@@ -187,45 +275,37 @@ selectVersion() {
     fi
   fi
 
-  # Preserve the existing preference for Enterprise, Ultimate, and the
-  # normal Pro/Professional/Business edition. The remaining entries provide
-  # deterministic selection when those editions are absent.
-  for suffix in "${priorities[@]}"; do
+  # Prefer the normal edition within each selection family. hasVersion()
+  # still allows its Evaluation counterpart when the normal variant is absent.
+  for suffix in "${suffixes[@]}"; do
     for base in "${bases[@]}"; do
       prefer="$base$suffix"
 
-      # Automatic selection must prefer an edition that is actually present.
-      for actual in "${versions[@]}"; do
-        [[ "${actual%-eval}" == "${prefer%-eval}" ]] || continue
-
-        if match=$(hasVersion "$prefer" "${versions[@]}"); then
-          echo "$match"
-          return 0
-        fi
-      done
+      if match=$(hasVersion "$prefer" "${versions[@]}"); then
+        echo "$match"
+        return 0
+      fi
     done
   done
 
-  # Future or unusual edition that getVersion() recognizes but which is not
-  # included in the priority list: use the first recognized WIM image.
+  # When the normal edition is absent, select another compatible member of
+  # that family, such as N, Workstations, or a future dynamic variant.
+  for priority in "${priorities[@]}"; do
+    for (( i=0; i<${#versions[@]}; i++ )); do
+      [[ "${groups[$i]}" == "$priority" ]] || continue
+
+      actual="${versions[$i]}"
+
+      if match=$(hasVersion "$actual" "${versions[@]}"); then
+        echo "$match"
+        return 0
+      fi
+    done
+  done
+
+  # Future or unusual editions that do not belong to a known selection
+  # family use the first recognized WIM image.
   echo "${versions[0]}"
-  return 0
-}
-
-detectVersion() {
-
-  local xml="$1"
-  local suggested="${2:-}"
-  local id platform
-
-  platform=$(getPlatform "$xml")
-  id=$(selectVersion "DISPLAYNAME" "$xml" "$platform" "$suggested")
-  [ -z "$id" ] &&
-    id=$(selectVersion "PRODUCTNAME" "$xml" "$platform" "$suggested")
-  [ -z "$id" ] &&
-    id=$(selectVersion "NAME" "$xml" "$platform" "$suggested")
-
-  echo "$id"
   return 0
 }
 
@@ -235,11 +315,15 @@ getImageIndex() {
   local wanted="$2"
   local platform tag index name id
 
+  local -a matches=()
+
   [ -z "$wanted" ] && return 1
 
   platform=$(getPlatform "$xml")
 
   for tag in DISPLAYNAME PRODUCTNAME NAME; do
+
+    matches=()
 
     while IFS=$'\t' read -r index name; do
       [ -n "$index" ] || continue
@@ -249,8 +333,7 @@ getImageIndex() {
       id=$(getVersion "$name" "$platform")
       [[ "${id,,}" == "${wanted,,}" ]] || continue
 
-      echo "$index"
-      return 0
+      matches+=("$index")
     done < <(
       awk -v tag="$tag" '
         /<IMAGE INDEX="/ {
@@ -271,6 +354,21 @@ getImageIndex() {
         }
       ' <<< "$xml"
     )
+
+    case "${#matches[@]}" in
+      0 )
+        continue
+        ;;
+      1 )
+        echo "${matches[0]}"
+        return 0
+        ;;
+      * )
+        # The current field is ambiguous, so try the remaining WIM fields
+        # before concluding that no unique image index can be determined.
+        continue
+        ;;
+    esac
 
   done
 
@@ -426,7 +524,7 @@ detectImage() {
     return 0
   fi
 
-  local src wim info index suggested
+  local src wim info index suggested edition rc=0
   src=$(find "$dir" -maxdepth 1 -type d -iname sources -print -quit)
 
   if [ ! -d "$src" ]; then
@@ -442,11 +540,17 @@ detectImage() {
     return 1
   fi
 
-  if ! info=$(wimlib-imagex info -xml "$wim" |
-    iconv -f UTF-16LE -t UTF-8); then
+  info=$(wimlib-imagex info -xml "$wim" |
+    iconv -f UTF-16LE -t UTF-8) || {
+    rc=$?
+
+    if (( rc >= 129 )); then
+      exit "$rc"
+    fi
+
     warn "failed to read Windows image information, $FB"
     return 1
-  fi
+  }
 
   checkPlatform "$info" || exit 67
 
@@ -457,6 +561,21 @@ detectImage() {
   fi
 
   DETECTED=$(detectVersion "$info" "$suggested")
+
+  if [ -n "$EDITION" ]; then
+    case "${DETECTED,,}" in
+      "win2003"* | "win2008"* | "win2012"* | "win2016"* | \
+      "win2019"* | "win2022"* | "win2025"* )
+        edition=$(normalizeServerEditionID "$EDITION")
+
+        if [ -n "$edition" ] &&
+          [[ "${DETECTED,,}" != *"-${edition,,}" &&
+            "${DETECTED,,}" != *"-${edition,,}-eval" ]]; then
+          EDITION=""
+        fi
+        ;;
+    esac
+  fi
 
   if [ -z "$DETECTED" ]; then
     msg="Failed to determine Windows version from image"
@@ -493,7 +612,7 @@ detectImage() {
   msg="the answer file for $desc was not found ($DETECTED.xml)"
   local fallback="/run/assets/${DETECTED%%-*}.xml"
 
-  if setXML "$fallback" || enabled "$MANUAL"; then
+  if setXML "$fallback" "$index" || enabled "$MANUAL"; then
     ! enabled "$MANUAL" && warn "${msg}."
   else
     MANUAL="Y"
